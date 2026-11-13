@@ -34,7 +34,7 @@ import net.minecraft.world.level.levelgen.structure.StructureStart;
  *
  * "Stone" is stone with patches of granite, andesite, diorite, gravel and tuff.
  * No deepslate, no obsidian, no caves, no ores, no grass, no trees, no water.
- * Only chunks generated after the mod is installed are changed.
+ * Chunks in the Farlands that were generated before the mod was installed are rewritten when they load.
  */
 public class FarlandsMod implements ModInitializer {
     // ---- tweak these -----------------------------------------------------------------------
@@ -66,8 +66,10 @@ public class FarlandsMod implements ModInitializer {
 
     @Override
     public void onInitialize() {
-        ServerChunkEvents.CHUNK_LOAD.register((level, chunk, generated) -> {
-            if (generated && level.dimension() == Level.OVERWORLD) rewrite(level, chunk);
+        // The rewrite is deterministic, so it is safe to run on every chunk load: a chunk that was
+        // already rewritten needs no changes and is skipped quickly.
+        ServerChunkEvents.CHUNK_LOAD.register((level, chunk) -> {
+            if (level.dimension() == Level.OVERWORLD) rewrite(level, chunk);
         });
     }
 
@@ -115,6 +117,7 @@ public class FarlandsMod implements ModInitializer {
             }
         }
 
+        boolean changed = false;
         for (int lx = 0; lx < 16; lx++) {
             for (int lz = 0; lz < 16; lz++) {
                 int x = minX + lx;
@@ -132,11 +135,14 @@ public class FarlandsMod implements ModInitializer {
                         if (want == null) continue; // keep what vanilla generated
                         if (section.getBlockState(lx, ly, lz) != want) {
                             section.setBlockState(lx, ly, lz, want, false);
+                            changed = true;
                         }
                     }
                 }
             }
         }
+
+        if (!changed) return; // already rewritten earlier
 
         // Drop block entities (chests, spawners, ...) whose block no longer exists.
         for (BlockPos pos : new ArrayList<>(chunk.getBlockEntitiesPos())) {
