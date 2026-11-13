@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "farlands",
+  "version": "${version}",
+  "name": "Farlands",
+  "description": "A stone Farlands beyond 12,550,820 blocks: plain stone, a void gap, stone with structures, a chessboard of chunks, a corrupting edge, then void.",
+  "authors": ["you"],
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": { "main": ["dev.hmp.farlands.FarlandsMod"] },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
