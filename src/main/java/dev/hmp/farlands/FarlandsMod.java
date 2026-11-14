@@ -53,7 +53,7 @@ public class FarlandsMod implements ModInitializer {
     // -----------------------------------------------------------------------------------------
 
     /** The first blocks of the Farlands are eroded, so the start is a ragged edge instead of a flat wall. */
-    static final int RAGGED = 64;
+    static final int RAGGED = 0;
 
     private static final int END_PLAIN = PLAIN;
     private static final int END_GAP = END_PLAIN + GAP;
