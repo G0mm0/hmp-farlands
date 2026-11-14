@@ -32,7 +32,9 @@ import net.minecraft.world.level.levelgen.structure.StructureStart;
  *   d 20,100 - 20,600   corruption: more and more blocks are missing (500 blocks)
  *   d        > 20,600   void
  *
- * "Stone" is stone with patches of granite, andesite, diorite, gravel and tuff.
+ * The "Farlands" terrain is the old terrain noise breaking down past 12,550,820 blocks (see
+ * FarlandsTerrain): tall stretched walls and curtains of stone from y=-64 up to about y=255.
+ * It is stone with natural blobs of granite, andesite, diorite, gravel and tuff.
  * No deepslate, no obsidian, no caves, no ores, no grass, no trees, no water.
  * Chunks in the Farlands that were generated before the mod was installed are rewritten when they load.
  */
@@ -54,15 +56,21 @@ public class FarlandsMod implements ModInitializer {
     private static final int END_CHESS = END_STRUCTURES + CHESS;
     private static final int END_CORRUPT = END_CHESS + CORRUPT;
 
+    private static FarlandsTerrain generator;
+    private static long generatorSeed;
+
+    private static byte[] terrainFor(ServerLevel level, int chunkX, int chunkZ) {
+        long seed = level.getSeed();
+        if (generator == null || generatorSeed != seed) {
+            generator = new FarlandsTerrain(seed);
+            generatorSeed = seed;
+        }
+        return generator.generate(chunkX, chunkZ);
+    }
+
     private enum Mode { VANILLA, VOID, SLAB, SLAB_KEEP_STRUCTURES, CORRUPT }
 
     private static final BlockState AIR = Blocks.AIR.defaultBlockState();
-    private static final BlockState STONE = Blocks.STONE.defaultBlockState();
-    private static final BlockState GRANITE = Blocks.GRANITE.defaultBlockState();
-    private static final BlockState DIORITE = Blocks.DIORITE.defaultBlockState();
-    private static final BlockState ANDESITE = Blocks.ANDESITE.defaultBlockState();
-    private static final BlockState GRAVEL = Blocks.GRAVEL.defaultBlockState();
-    private static final BlockState TUFF = Blocks.TUFF.defaultBlockState();
 
     @Override
     public void onInitialize() {
@@ -117,6 +125,7 @@ public class FarlandsMod implements ModInitializer {
             }
         }
 
+        byte[] terrain = null;
         boolean changed = false;
         for (int lx = 0; lx < 16; lx++) {
             for (int lz = 0; lz < 16; lz++) {
@@ -125,13 +134,14 @@ public class FarlandsMod implements ModInitializer {
                 Mode mode = modeAt(x, z);
                 if (mode == Mode.VANILLA) continue;
                 double corrupt = mode == Mode.CORRUPT ? corruption(x, z) : 0.0D;
+                if (mode != Mode.VOID && terrain == null) terrain = terrainFor(level, minX >> 4, minZ >> 4);
 
                 for (int si = 0; si < chunk.getSectionsCount(); si++) {
                     LevelChunkSection section = chunk.getSection(si);
                     int baseY = chunk.getSectionYFromSectionIndex(si) << 4;
                     for (int ly = 0; ly < 16; ly++) {
                         int y = baseY + ly;
-                        BlockState want = wanted(mode, corrupt, boxes, x, y, z);
+                        BlockState want = wanted(mode, corrupt, boxes, terrain, lx, lz, x, y, z);
                         if (want == null) continue; // keep what vanilla generated
                         if (section.getBlockState(lx, ly, lz) != want) {
                             section.setBlockState(lx, ly, lz, want, false);
@@ -159,7 +169,8 @@ public class FarlandsMod implements ModInitializer {
     }
 
     /** Returns the block that should be at x,y,z, or null to keep the vanilla block. */
-    private static BlockState wanted(Mode mode, double corrupt, List<BoundingBox> boxes, int x, int y, int z) {
+    private static BlockState wanted(Mode mode, double corrupt, List<BoundingBox> boxes, byte[] terrain,
+                                     int lx, int lz, int x, int y, int z) {
         switch (mode) {
             case VOID:
                 return AIR;
@@ -169,25 +180,19 @@ public class FarlandsMod implements ModInitializer {
                         if (box.isInside(x, y, z)) return null; // structure: untouched
                     }
                 }
-                return slab(x, y, z);
+                return terrainBlock(terrain, lx, lz, y);
             case CORRUPT:
                 if (y >= BOTTOM && y <= TOP && cellRandom(x >> 1, y >> 1, z >> 1, 7919L) < corrupt) return AIR;
-                return slab(x, y, z);
+                return terrainBlock(terrain, lx, lz, y);
             case SLAB:
             default:
-                return slab(x, y, z);
+                return terrainBlock(terrain, lx, lz, y);
         }
     }
 
-    private static BlockState slab(int x, int y, int z) {
-        if (y < BOTTOM || y > TOP) return AIR;
-        double r = cellRandom(Math.floorDiv(x, 5), Math.floorDiv(y, 5), Math.floorDiv(z, 5), 104729L);
-        if (r < 0.70D) return STONE;
-        if (r < 0.78D) return GRANITE;
-        if (r < 0.86D) return DIORITE;
-        if (r < 0.94D) return ANDESITE;
-        if (r < 0.98D) return GRAVEL;
-        return TUFF;
+    private static BlockState terrainBlock(byte[] terrain, int lx, int lz, int y) {
+        if (terrain == null || y < FarlandsTerrain.BOTTOM || y > FarlandsTerrain.TOP) return AIR;
+        return FarlandsTerrain.state(terrain[FarlandsTerrain.index(lx, lz, y)]);
     }
 
     /** Deterministic pseudo-random number in [0, 1) for a cell, so the same world always looks the same. */
