@@ -11,11 +11,13 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.level.levelgen.structure.BoundingBox;
+import net.minecraft.world.level.levelgen.structure.StructurePiece;
 import net.minecraft.world.level.levelgen.structure.StructureStart;
 
 /**
@@ -49,6 +51,9 @@ public class FarlandsMod implements ModInitializer {
     static final int TOP = 256;             // highest solid block
     static final int BOTTOM = -64;          // lowest solid block
     // -----------------------------------------------------------------------------------------
+
+    /** The first blocks of the Farlands are eroded, so the start is a ragged edge instead of a flat wall. */
+    static final int RAGGED = 64;
 
     private static final int END_PLAIN = PLAIN;
     private static final int END_GAP = END_PLAIN + GAP;
@@ -119,7 +124,7 @@ public class FarlandsMod implements ModInitializer {
         for (int lx = 0; lx < 16 && boxes == null; lx++) {
             for (int lz = 0; lz < 16; lz++) {
                 if (modeAt(minX + lx, minZ + lz) == Mode.SLAB_KEEP_STRUCTURES) {
-                    boxes = structureBoxes(level, cp);
+                    boxes = structureBoxes(level, cp, minX, minZ);
                     break;
                 }
             }
@@ -141,7 +146,8 @@ public class FarlandsMod implements ModInitializer {
                     int baseY = chunk.getSectionYFromSectionIndex(si) << 4;
                     for (int ly = 0; ly < 16; ly++) {
                         int y = baseY + ly;
-                        BlockState want = wanted(mode, corrupt, boxes, terrain, lx, lz, x, y, z);
+                        BlockState current = section.getBlockState(lx, ly, lz);
+                        BlockState want = wanted(mode, corrupt, boxes, terrain, current, lx, lz, x, y, z);
                         if (want == null) continue; // keep what vanilla generated
                         if (section.getBlockState(lx, ly, lz) != want) {
                             section.setBlockState(lx, ly, lz, want, false);
@@ -170,14 +176,18 @@ public class FarlandsMod implements ModInitializer {
 
     /** Returns the block that should be at x,y,z, or null to keep the vanilla block. */
     private static BlockState wanted(Mode mode, double corrupt, List<BoundingBox> boxes, byte[] terrain,
-                                     int lx, int lz, int x, int y, int z) {
+                                     BlockState current, int lx, int lz, int x, int y, int z) {
         switch (mode) {
             case VOID:
                 return AIR;
             case SLAB_KEEP_STRUCTURES:
                 if (boxes != null) {
                     for (BoundingBox box : boxes) {
-                        if (box.isInside(x, y, z)) return null; // structure: untouched
+                        if (box.isInside(x, y, z)) {
+                            // Inside a structure piece: keep the structure's own blocks and air, but replace
+                            // the natural terrain vanilla put around it (stone, deepslate, bedrock, ...).
+                            return isNaturalTerrain(current) ? terrainBlock(terrain, lx, lz, y) : null;
+                        }
                     }
                 }
                 return terrainBlock(terrain, lx, lz, y);
@@ -186,8 +196,17 @@ public class FarlandsMod implements ModInitializer {
                 return terrainBlock(terrain, lx, lz, y);
             case SLAB:
             default:
+                if (isRagged(x, y, z)) return AIR;
                 return terrainBlock(terrain, lx, lz, y);
         }
+    }
+
+    /** Erodes the first RAGGED blocks of the Farlands: strong at the very edge, fading to nothing. */
+    private static boolean isRagged(int x, int y, int z) {
+        int d = Math.max(Math.abs(x), Math.abs(z)) - EDGE;
+        if (d >= RAGGED) return false;
+        double chance = 0.6D * (1.0D - d / (double) RAGGED);
+        return cellRandom(Math.floorDiv(x, 3), Math.floorDiv(y, 3), Math.floorDiv(z, 3), 31337L) < chance;
     }
 
     private static BlockState terrainBlock(byte[] terrain, int lx, int lz, int y) {
@@ -206,12 +225,38 @@ public class FarlandsMod implements ModInitializer {
         return (h & 0xFFFFFFL) / (double) 0x1000000L;
     }
 
-    private static List<BoundingBox> structureBoxes(ServerLevel level, ChunkPos cp) {
+    /** Boxes of the individual pieces of every structure that touches this chunk. */
+    private static List<BoundingBox> structureBoxes(ServerLevel level, ChunkPos cp, int minX, int minZ) {
         List<BoundingBox> boxes = new ArrayList<>();
         for (StructureStart start : level.structureManager().startsForStructure(cp, structure -> true)) {
-            if (start.isValid()) boxes.add(start.getBoundingBox());
+            if (!start.isValid()) continue;
+            for (StructurePiece piece : start.getPieces()) {
+                BoundingBox box = piece.getBoundingBox();
+                if (box.intersects(minX, minZ, minX + 15, minZ + 15)) boxes.add(box);
+            }
         }
         return boxes;
+    }
+
+    /** Natural terrain that vanilla generated around a structure. It is replaced; structure blocks are not. */
+    private static boolean isNaturalTerrain(BlockState state) {
+        if (state.is(Blocks.TUFF)) return false; // trial chambers and ancient cities are built with it
+        return state.is(BlockTags.BASE_STONE_OVERWORLD)   // stone, granite, diorite, andesite, deepslate
+                || state.is(Blocks.BEDROCK)
+                || state.is(BlockTags.DIRT)                // dirt, grass block, podzol, moss, mud, ...
+                || state.is(BlockTags.SAND)
+                || state.is(Blocks.GRAVEL)
+                || state.is(Blocks.CLAY)
+                || state.is(BlockTags.COAL_ORES) || state.is(BlockTags.IRON_ORES) || state.is(BlockTags.COPPER_ORES)
+                || state.is(BlockTags.GOLD_ORES) || state.is(BlockTags.REDSTONE_ORES) || state.is(BlockTags.LAPIS_ORES)
+                || state.is(BlockTags.DIAMOND_ORES) || state.is(BlockTags.EMERALD_ORES)
+                || state.is(Blocks.WATER) || state.is(Blocks.LAVA)
+                || state.is(BlockTags.ICE) || state.is(Blocks.SNOW_BLOCK) || state.is(Blocks.SNOW)
+                || state.is(BlockTags.LEAVES) || state.is(BlockTags.FLOWERS)
+                || state.is(Blocks.SHORT_GRASS) || state.is(Blocks.TALL_GRASS)
+                || state.is(Blocks.FERN) || state.is(Blocks.LARGE_FERN)
+                || state.is(Blocks.DRIPSTONE_BLOCK) || state.is(Blocks.POINTED_DRIPSTONE)
+                || state.is(Blocks.CALCITE) || state.is(Blocks.SMOOTH_BASALT);
     }
 
     /**

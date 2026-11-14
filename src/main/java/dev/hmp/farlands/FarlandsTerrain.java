@@ -18,8 +18,12 @@ import net.minecraft.world.level.block.state.BlockState;
  * stretches the terrain into tall curtains and walls. This class reproduces that behaviour (the
  * integer cast below saturates in Java just like the old code did).
  *
+ * The noise covers the whole height, y = -64 to y = 256, so the underside is shaped like the top.
+ *
  * Output per chunk: a block kind for every block from y = -64 to y = 256:
- * 0 air, 1 stone, 2 granite, 3 diorite, 4 andesite, 5 gravel, 6 tuff.
+ * 0 air, 1 stone, 2 granite, 3 diorite, 4 andesite, 5 gravel, 6 tuff, 7 grass block, 8 dirt.
+ * Every exposed top surface gets a grass block with three dirt blocks under it, like the vanilla
+ * surface, which gives the ledges of the walls their grass and dirt stripes.
  * Granite, diorite, andesite, gravel and tuff are natural-looking blobs, placed the way vanilla
  * places its ore-like veins, and they only replace stone.
  */
@@ -35,7 +39,9 @@ final class FarlandsTerrain {
             Blocks.DIORITE.defaultBlockState(),
             Blocks.ANDESITE.defaultBlockState(),
             Blocks.GRAVEL.defaultBlockState(),
-            Blocks.TUFF.defaultBlockState()
+            Blocks.TUFF.defaultBlockState(),
+            Blocks.GRASS_BLOCK.defaultBlockState(),
+            Blocks.DIRT.defaultBlockState()
     };
 
     static BlockState state(byte kind) {
@@ -102,11 +108,13 @@ final class FarlandsTerrain {
     byte[] generate(int chunkX, int chunkZ) {
         byte[] kinds = new byte[256 * HEIGHT];
 
-        double[][][] d = new double[5][33][5];
+        // Grid points every 4 blocks in x and z and every 8 blocks in y. Index j + 8 holds the
+        // point at y = j * 8, so the grid runs from y = -64 (j = -8) to y = 256 (j = 32).
+        double[][][] d = new double[5][41][5];
         for (int i = 0; i < 5; i++) {
             for (int k = 0; k < 5; k++) {
-                for (int j = 0; j < 33; j++) {
-                    d[i][j][k] = density((long) chunkX * 4 + i, j, (long) chunkZ * 4 + k);
+                for (int j = -8; j <= 32; j++) {
+                    d[i][j + 8][k] = density((long) chunkX * 4 + i, j, (long) chunkZ * 4 + k);
                 }
             }
         }
@@ -117,9 +125,9 @@ final class FarlandsTerrain {
             for (int lz = 0; lz < 16; lz++) {
                 int k = lz >> 2;
                 double fz = (lz & 3) / 4.0D;
-                for (int y = 0; y < TOP; y++) {
-                    int j = y >> 3;
-                    double fy = (y & 7) / 8.0D;
+                for (int y = BOTTOM; y < TOP; y++) {
+                    int j = Math.floorDiv(y, 8) + 8;
+                    double fy = Math.floorMod(y, 8) / 8.0D;
                     double a = lerp(fz, d[i][j][k], d[i][j][k + 1]);
                     double b = lerp(fz, d[i + 1][j][k], d[i + 1][j][k + 1]);
                     double c = lerp(fz, d[i][j + 1][k], d[i][j + 1][k + 1]);
@@ -127,16 +135,37 @@ final class FarlandsTerrain {
                     double v = lerp(fy, lerp(fx, a, b), lerp(fx, c, e));
                     if (v > 0.0D) kinds[index(lx, lz, y)] = 1; // NaN is false: air
                 }
-                for (int y = BOTTOM; y < 0; y++) kinds[index(lx, lz, y)] = 1; // solid below y=0
             }
         }
 
         placeBlobs(kinds, chunkX, chunkZ);
+        addSurface(kinds);
         return kinds;
     }
 
     private static double lerp(double t, double a, double b) {
         return a + t * (b - a);
+    }
+
+    /** Grass block on every exposed top, with three dirt blocks beneath it. */
+    private static void addSurface(byte[] kinds) {
+        for (int lx = 0; lx < 16; lx++) {
+            for (int lz = 0; lz < 16; lz++) {
+                int depth = 0; // 0: air directly above, 1..3: dirt layers, 4: below the surface layer
+                for (int y = TOP - 1; y >= BOTTOM; y--) {
+                    int idx = index(lx, lz, y);
+                    if (kinds[idx] == 0) {
+                        depth = 0;
+                    } else if (depth == 0) {
+                        kinds[idx] = 7;
+                        depth = 1;
+                    } else if (depth <= 3) {
+                        kinds[idx] = 8;
+                        depth++;
+                    }
+                }
+            }
+        }
     }
 
     // ---- natural blobs of granite, diorite, andesite, gravel and tuff -----------------------
