@@ -38,7 +38,9 @@ import net.minecraft.world.level.levelgen.structure.StructureStart;
  * FarlandsTerrain): tall stretched walls and curtains of stone from y=-64 up to about y=255.
  * It is stone with natural blobs of granite, andesite, diorite, gravel and tuff.
  * No deepslate, no obsidian, no caves, no ores, no grass, no trees, no water.
- * Chunks in the Farlands that were generated before the mod was installed are rewritten when they load.
+ * Each chunk is rewritten exactly once. A hidden marker block (structure void, which is invisible and has
+ * no collision) is placed at the very top of the chunk, y=319, to remember that. After that the chunk
+ * is never touched again, so builds, holes and schematics in the Farlands stay.
  */
 public class FarlandsMod implements ModInitializer {
     // ---- tweak these -----------------------------------------------------------------------
@@ -73,12 +75,15 @@ public class FarlandsMod implements ModInitializer {
         return generator.generate(chunkX, chunkZ);
     }
 
+    private static final BlockState MARKER = Blocks.STRUCTURE_VOID.defaultBlockState();
+
     private enum Mode { VANILLA, VOID, SLAB, SLAB_KEEP_STRUCTURES, CORRUPT }
 
     private static final BlockState AIR = Blocks.AIR.defaultBlockState();
 
     @Override
     public void onInitialize() {
+        BaseCopier.init();
         // The rewrite is deterministic, so it is safe to run on every chunk load: a chunk that was
         // already rewritten needs no changes and is skipped quickly.
         ServerChunkEvents.CHUNK_LOAD.register((level, chunk) -> {
@@ -119,6 +124,16 @@ public class FarlandsMod implements ModInitializer {
         int far = Math.max(Math.max(Math.abs(minX), Math.abs(minX + 15)), Math.max(Math.abs(minZ), Math.abs(minZ + 15)));
         if (far < EDGE) return;
 
+        // Already processed once? Then leave the chunk alone, so player changes are kept.
+        BlockPos marker = new BlockPos(minX, 319, minZ);
+        if (chunk.getBlockState(marker).is(Blocks.STRUCTURE_VOID)) return;
+        // A chunk that players have already spent time in (from an older version of this mod) is adopted
+        // as it is, with its builds and holes, instead of being rewritten again.
+        if (chunk.getInhabitedTime() > 0L) {
+            chunk.setBlockState(marker, MARKER, 0);
+            return;
+        }
+
         // Boxes of structures that touch this chunk (only needed in the structure zone).
         List<BoundingBox> boxes = null;
         for (int lx = 0; lx < 16 && boxes == null; lx++) {
@@ -158,20 +173,22 @@ public class FarlandsMod implements ModInitializer {
             }
         }
 
-        if (!changed) return; // already rewritten earlier
+        if (changed) {
+            // Drop block entities (chests, spawners, ...) whose block no longer exists.
+            for (BlockPos pos : new ArrayList<>(chunk.getBlockEntitiesPos())) {
+                if (!chunk.getBlockState(pos).hasBlockEntity()) chunk.removeBlockEntity(pos);
+            }
 
-        // Drop block entities (chests, spawners, ...) whose block no longer exists.
-        for (BlockPos pos : new ArrayList<>(chunk.getBlockEntitiesPos())) {
-            if (!chunk.getBlockState(pos).hasBlockEntity()) chunk.removeBlockEntity(pos);
+            Heightmap.primeHeightmaps(chunk, EnumSet.of(
+                    Heightmap.Types.MOTION_BLOCKING,
+                    Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+                    Heightmap.Types.OCEAN_FLOOR,
+                    Heightmap.Types.WORLD_SURFACE));
         }
 
-        Heightmap.primeHeightmaps(chunk, EnumSet.of(
-                Heightmap.Types.MOTION_BLOCKING,
-                Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
-                Heightmap.Types.OCEAN_FLOOR,
-                Heightmap.Types.WORLD_SURFACE));
-
-        markUnsaved(chunk, minX, minZ);
+        // Remember that this chunk is done. Placing a block through the normal method also flags the
+        // chunk as unsaved, so everything above is written to disk.
+        chunk.setBlockState(marker, MARKER, 0);
     }
 
     /** Returns the block that should be at x,y,z, or null to keep the vanilla block. */
@@ -257,17 +274,5 @@ public class FarlandsMod implements ModInitializer {
                 || state.is(Blocks.FERN) || state.is(Blocks.LARGE_FERN)
                 || state.is(Blocks.DRIPSTONE_BLOCK) || state.is(Blocks.POINTED_DRIPSTONE)
                 || state.is(Blocks.CALCITE) || state.is(Blocks.SMOOTH_BASALT);
-    }
-
-    /**
-     * Make sure the chunk is saved with its new blocks: changing one block through the normal
-     * method flags the chunk as unsaved. A high-up block that is air (or about to be) is used.
-     */
-    private static void markUnsaved(LevelChunk chunk, int minX, int minZ) {
-        BlockPos pos = new BlockPos(minX, 318, minZ);
-        BlockState now = chunk.getBlockState(pos);
-        if (now.hasBlockEntity()) return;
-        chunk.setBlockState(pos, Blocks.BARRIER.defaultBlockState(), 0);
-        chunk.setBlockState(pos, now, 0);
     }
 }
