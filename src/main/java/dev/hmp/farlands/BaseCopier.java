@@ -26,8 +26,12 @@ import net.minecraft.nbt.CompoundTag;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.Clearable;
+import net.minecraft.world.Container;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.EntityBlock;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -49,9 +53,10 @@ import net.minecraft.world.level.storage.LevelResource;
  *            nearest to it and at the same "latitude" (same x or z) as the original, so somebody
  *            walking from the base straight to the Farlands can run into it. The position is fixed
  *            by a seeded random number, so it never changes.
- * COPY     - whole chunk columns (every block from the bedrock to the build limit, biomes, chests and
- *            other block entities with their contents) are copied one chunk every few ticks so the
- *            server never lags. Entities (mobs, item frames, armor stands) are not copied.
+ * COPY     - whole chunk columns (every block from the bedrock to the build limit, biomes, signs, chests and
+ *            other block entities) are copied one chunk every few ticks so the
+ *            server never lags. Containers arrive EMPTY (setting copyContainerItems=false is the default).
+ *            Entities (mobs, item frames, armor stands) are not copied.
  * REFRESH  - every `refreshMinutes` game minutes the copy is updated with the current state of the
  *            base, but only if the base was not damaged: if more than `removedLimit` blocks that
  *            are in the copy are gone from the base, the base is assumed to be griefed or blown up
@@ -73,6 +78,7 @@ final class BaseCopier {
     private static int minDistance = 1500;      // placement: blocks past the Farlands line, at least
     private static int maxDistance = FarlandsMod.PLAIN - 800; // ... and at most (the void gap starts at PLAIN)
     private static boolean sameLatitude = true; // keep the base's own x or z coordinate
+    private static boolean copyContainerItems = false; // false: chests, barrels, dispensers ... arrive empty
 
     private static final int DETECT_INTERVAL = 1200; // ticks
     private static final int SAVE_INTERVAL = 6000;   // ticks
@@ -107,6 +113,10 @@ final class BaseCopier {
         int phase;      // 0: compare the base with the copy (refresh only), 1: copy
         int index;      // chunk number inside the (2r+1) x (2r+1) square
         long removed;   // blocks that are in the copy but gone from the base
+        int blockEntities; // block entities (chests, signs, ...) copied by this task
+        int stacksSeen;    // item stacks found in the containers of the base
+        int stacksCopied;  // item stacks that ended up in the containers of the copy
+        int emptied;       // containers (and other item holders) that were left empty on purpose
 
         Task(Base base, boolean compareFirst) {
             this.base = base;
@@ -341,11 +351,15 @@ final class BaseCopier {
                     return;
                 }
                 LevelChunk src = level.getChunk(sx, sz);
-                copyChunk(level, src, dst, (dx - sx) * 16, (dz - sz) * 16);
+                copyChunk(level, src, dst, (dx - sx) * 16, (dz - sz) * 16, task);
                 task.index++;
                 if (task.index >= side * side) {
                     base.copied = true;
-                    finish(task, now, "copied to block (" + (base.dstCx * 16 + 8) + ", " + (base.dstCz * 16 + 8) + ")");
+                    String where = "copied to block (" + (base.dstCx * 16 + 8) + ", " + (base.dstCz * 16 + 8) + "), "
+                            + task.blockEntities + " block entities, ";
+                    finish(task, now, copyContainerItems
+                            ? where + "item stacks in containers: " + task.stacksSeen + " in the base, " + task.stacksCopied + " in the copy"
+                            : where + task.emptied + " containers left empty on purpose");
                 }
             }
         } catch (RuntimeException e) {
@@ -380,7 +394,7 @@ final class BaseCopier {
     }
 
     /** Replaces the chunk `dst` with the contents of `src`: blocks, biomes and block entities. */
-    private static void copyChunk(ServerLevel level, LevelChunk src, LevelChunk dst, int shiftX, int shiftZ) {
+    private static void copyChunk(ServerLevel level, LevelChunk src, LevelChunk dst, int shiftX, int shiftZ, Task task) {
         LevelChunkSection[] from = src.getSections();
         LevelChunkSection[] to = dst.getSections();
         int n = Math.min(from.length, to.length);
@@ -393,12 +407,57 @@ final class BaseCopier {
             BlockEntity entity = src.getBlockEntity(pos);
             if (entity == null) continue;
             BlockPos moved = pos.offset(shiftX, 0, shiftZ);
+            BlockState movedState = dst.getBlockState(moved);
+
+            // 1. Copy everything the block entity knows (name, lock, items, ...) through its saved data.
             CompoundTag tag = entity.saveWithFullMetadata(level.registryAccess());
             tag.putInt("x", moved.getX());
             tag.putInt("y", moved.getY());
             tag.putInt("z", moved.getZ());
-            BlockEntity copy = BlockEntity.loadStatic(moved, dst.getBlockState(moved), tag, level.registryAccess());
-            if (copy != null) dst.setBlockEntity(copy);
+            if (!copyContainerItems) {
+                tag.remove("Items");         // chests, barrels, dispensers, droppers, hoppers, shulker boxes, furnaces, ...
+                tag.remove("LootTable");     // an unopened loot chest becomes a plain empty chest
+                tag.remove("LootTableSeed");
+            }
+            BlockEntity copy = BlockEntity.loadStatic(moved, movedState, tag, level.registryAccess());
+            if (copy == null && movedState.getBlock() instanceof EntityBlock maker) {
+                copy = maker.newBlockEntity(moved, movedState); // fallback: a fresh, empty block entity
+            }
+            if (copy == null) {
+                LOGGER.warn("Farlands: could not copy the block entity at {}", pos);
+                continue;
+            }
+            dst.setBlockEntity(copy);
+            task.blockEntities++;
+
+            // 2. Containers (chests, barrels, dispensers, droppers, hoppers, shulker boxes, furnaces, ...):
+            //    also copy the items slot by slot, so they arrive even if step 1 lost them. Containers that
+            //    still hold an unopened loot table are skipped, because reading them would generate the loot.
+            if (!copyContainerItems) {
+                // Make sure nothing at all is left inside (also jukebox discs, lectern books, campfire food, ...).
+                if (copy instanceof Clearable clearable) {
+                    clearable.clearContent();
+                    task.emptied++;
+                }
+            } else if (entity instanceof Container baseInv && copy instanceof Container copyInv && !tag.contains("LootTable")) {
+                int slots = Math.min(baseInv.getContainerSize(), copyInv.getContainerSize());
+                int seen = 0;
+                int copied = 0;
+                for (int slot = 0; slot < slots; slot++) {
+                    ItemStack stack = baseInv.getItem(slot);
+                    if (stack.isEmpty()) continue;
+                    seen++;
+                    copyInv.setItem(slot, stack.copy());
+                }
+                for (int slot = 0; slot < slots; slot++) {
+                    if (!copyInv.getItem(slot).isEmpty()) copied++;
+                }
+                task.stacksSeen += seen;
+                task.stacksCopied += copied;
+                if (seen != copied) {
+                    LOGGER.warn("Farlands: container at {} had {} item stacks, its copy has {}", pos, seen, copied);
+                }
+            }
         }
 
         Heightmap.primeHeightmaps(dst, EnumSet.of(
@@ -451,6 +510,9 @@ final class BaseCopier {
                         "# true: same x or z coordinate as the base, so it can be found by walking straight there.",
                         "# false: random position along the Farlands.",
                         "sameLatitude=true",
+                        "# false: chests, barrels, dispensers and other containers arrive empty in the copy.",
+                        "# true: their items are copied as well.",
+                        "copyContainerItems=false",
                         "") + "\n");
             }
         } catch (IOException e) {
@@ -466,6 +528,7 @@ final class BaseCopier {
         minDistance = intProp(props, "minDistance", minDistance, 0);
         maxDistance = intProp(props, "maxDistance", maxDistance, 1);
         sameLatitude = Boolean.parseBoolean(props.getProperty("sameLatitude", Boolean.toString(sameLatitude)).trim());
+        copyContainerItems = Boolean.parseBoolean(props.getProperty("copyContainerItems", Boolean.toString(copyContainerItems)).trim());
     }
 
     private static int intProp(Properties props, String name, int fallback, int min) {
